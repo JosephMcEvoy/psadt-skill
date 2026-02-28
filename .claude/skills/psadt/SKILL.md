@@ -263,3 +263,15 @@ Set-ADTActiveSetup -StubExePath 'powershell.exe' -Arguments '-NoProfile -Command
 # In Post-Uninstall
 Set-ADTActiveSetup -PurgeActiveSetupKey -Key 'AppUserConfig'
 ```
+
+## Testing
+
+Use the **vagrant-test** skill to test packages in an isolated Hyper-V VM before deploying to Intune/SCCM. The test workflow:
+
+1. Spins up a clean Windows 11 VM via Vagrant
+2. Maps the PSADT package folder into the VM
+3. Runs silent install, validates the result (installed apps, registry, files, shortcuts)
+4. Runs uninstall and verifies cleanup
+5. Destroys the VM
+
+See the `vagrant-test` skill for setup and usage.
