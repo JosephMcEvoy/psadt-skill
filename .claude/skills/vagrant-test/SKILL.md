@@ -12,158 +12,88 @@ Test PSADT deployment packages in an isolated Hyper-V VM using Vagrant. The VM i
 
 ## Prerequisites
 
-1. **Hyper-V** enabled (Windows 11 Pro)
+1. **Hyper-V** enabled (Windows 11 Pro) with a virtual switch (the "Default Switch" is created automatically)
 2. **Vagrant** installed: `winget install Hashicorp.Vagrant`
-3. A **Windows Vagrant box** added (one-time setup):
+3. A **Windows Vagrant box** added (one-time ~6 GB download):
    ```
-   vagrant box add gusztavvargadr/windows-11 --provider hyperv
+   "C:\Program Files\Vagrant\bin\vagrant.exe" box add gusztavvargadr/windows-11 --provider hyperv
    ```
 
-To check prerequisites:
-```bash
-vagrant --version
-vagrant box list
-```
+Note: Vagrant may not be in Git Bash PATH after install. Use full path: `"C:\Program Files\Vagrant\bin\vagrant.exe"`
+
+## How It Works
+
+The test runner uses **Copy-VMFile** (Hyper-V's built-in file transfer) instead of SMB shared folders. This avoids credential prompts and network share issues entirely.
+
+Flow:
+1. `vagrant up --no-provision` — boots a clean Windows 11 VM
+2. Enables Guest Service Interface on the VM (required for Copy-VMFile)
+3. Copies the PSADT package into the VM via `Copy-VMFile`
+4. Runs install/validate/uninstall provisioners via `vagrant provision`
+5. Pulls result JSON from the VM via `Invoke-Command -VMName`
+6. `vagrant destroy -f` — deletes the VM
 
 ## Workflow
 
-### Step 1: Set Up Test Environment
+### Step 1: Generate Test Environment
 
-Create a test directory alongside the PSADT package (or in a temp location):
+Use `generate_test.ps1` to scaffold a test directory for any PSADT package:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File "<skill-scripts-dir>/generate_test.ps1" `
+    -PackagePath "C:\path\to\PSADTPackage" `
+    -AppName "Application Name" `
+    -AppVendor "Vendor" `
+    -CheckFiles @("C:\Program Files\App\app.exe") `
+    -CheckShortcutRemoved "C:\Users\Public\Desktop\App.lnk"
+```
+
+This creates:
 
 ```
-PackageTest/
-├── Vagrantfile          # Generated from template
+PSADTPackage/test/
+├── Vagrantfile          # VM configuration (no synced folders)
+├── run_test.ps1         # Self-elevating test runner
 ├── scripts/
-│   ├── install.ps1      # Runs install inside VM
-│   ├── validate.ps1     # Checks install succeeded
-│   └── uninstall.ps1    # Runs uninstall inside VM
-└── results/             # Validation results written here
+│   └── validate.ps1     # App-specific validation checks
+└── results/             # Test results (JSON + log)
 ```
-
-Generate the Vagrantfile using the template in this skill's `assets/` directory. Customize:
-- `PACKAGE_PATH` — absolute path to the PSADT package folder
-- `APP_NAME` — application display name (for validation)
-- `APP_VENDOR` — vendor name (for validation)
-- Validation checks (registry keys, file paths, shortcuts to verify)
 
 ### Step 2: Run the Test
 
-```bash
-# From the test directory:
-vagrant up                    # Spin up clean Windows VM
-vagrant provision             # Run install + validation (auto-runs on first 'up')
+```powershell
+# Full cycle: boot → copy files → install → validate → uninstall → destroy
+powershell.exe -ExecutionPolicy Bypass -File run_test.ps1
 
-# Or run phases individually:
-vagrant provision --provision-with install
-vagrant provision --provision-with validate
-vagrant provision --provision-with uninstall
+# Or run individual phases:
+powershell.exe -ExecutionPolicy Bypass -File run_test.ps1 -Phase install
+powershell.exe -ExecutionPolicy Bypass -File run_test.ps1 -Phase validate
+powershell.exe -ExecutionPolicy Bypass -File run_test.ps1 -Phase uninstall
+powershell.exe -ExecutionPolicy Bypass -File run_test.ps1 -Phase destroy
 ```
+
+The script auto-elevates to admin (required for Hyper-V). Monitor progress in `results/test_log.txt`.
 
 ### Step 3: Review Results
 
-The validation provisioner writes results to the synced `results/` folder:
-- `results/install_result.json` — exit code, log excerpts
-- `results/validation_result.json` — pass/fail for each check
+Results are written to the `results/` directory:
+- `test_log.txt` — full run log with timestamps and PASS/FAIL per check
+- `install_result.json` — install exit code and timing
+- `validation_result.json` — detailed check results
+- `uninstall_result.json` — uninstall exit code and timing
 
-Read these files to determine test outcome.
+## Key Design Decisions
 
-### Step 4: Tear Down
-
-```bash
-vagrant destroy -f            # Delete the VM completely
-```
-
-### Full Test Cycle (single command)
-
-```bash
-vagrant up && vagrant provision --provision-with validate && vagrant destroy -f
-```
-
-## Generating Test Scripts
-
-When generating test scripts for a specific PSADT package, populate the templates based on the package's `$adtSession` variables:
-
-### install.ps1 (runs inside VM)
-
-```powershell
-# Run PSADT silent install
-$packageDir = "C:\vagrant_package"
-Push-Location $packageDir
-& powershell.exe -ExecutionPolicy Bypass -File "Invoke-AppDeployToolkit.ps1" -DeployMode Silent
-$exitCode = $LASTEXITCODE
-Pop-Location
-
-# Write result
-@{ ExitCode = $exitCode; Timestamp = (Get-Date -Format o) } | ConvertTo-Json | Set-Content "C:\vagrant_results\install_result.json"
-exit $exitCode
-```
-
-### validate.ps1 (runs inside VM)
-
-```powershell
-$checks = @()
-
-# Check application is installed
-$app = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-                         "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -like "*APP_NAME*" }
-$checks += @{ Check = 'AppInstalled'; Pass = ($null -ne $app); Detail = $app.DisplayName }
-
-# Check files exist
-$filesToCheck = @(
-    # Populate with expected install paths
-    # "C:\Program Files\Vendor\App\app.exe"
-)
-foreach ($f in $filesToCheck) {
-    $checks += @{ Check = "FileExists:$f"; Pass = (Test-Path $f); Detail = $f }
-}
-
-# Check registry keys
-$regChecks = @(
-    # @{ Key = 'HKLM:\SOFTWARE\...'; Name = 'ValueName'; Expected = 'value' }
-)
-foreach ($r in $regChecks) {
-    $val = Get-ItemPropertyValue -Path $r.Key -Name $r.Name -ErrorAction SilentlyContinue
-    $checks += @{ Check = "Registry:$($r.Key)\$($r.Name)"; Pass = ($val -eq $r.Expected); Detail = "Got: $val" }
-}
-
-# Check desktop shortcut removed (if applicable)
-$shortcutPath = "C:\Users\Public\Desktop\APP_NAME.lnk"
-$checks += @{ Check = 'ShortcutRemoved'; Pass = (-not (Test-Path $shortcutPath)); Detail = $shortcutPath }
-
-# Write results
-@{ Checks = $checks; AllPassed = ($checks | Where-Object { -not $_.Pass }).Count -eq 0 } |
-    ConvertTo-Json -Depth 3 | Set-Content "C:\vagrant_results\validation_result.json"
-```
-
-### uninstall.ps1 (runs inside VM)
-
-```powershell
-$packageDir = "C:\vagrant_package"
-Push-Location $packageDir
-& powershell.exe -ExecutionPolicy Bypass -File "Invoke-AppDeployToolkit.ps1" -DeploymentType Uninstall -DeployMode Silent
-$exitCode = $LASTEXITCODE
-Pop-Location
-
-@{ ExitCode = $exitCode; Timestamp = (Get-Date -Format o) } | ConvertTo-Json | Set-Content "C:\vagrant_results\uninstall_result.json"
-exit $exitCode
-```
-
-## Vagrantfile Configuration
-
-The Vagrantfile template is in `assets/Vagrantfile.template`. Key settings:
-
-- **Box**: `gusztavvargadr/windows-11` (or `gusztavvargadr/windows-11-23h2-enterprise` for enterprise)
-- **Provider**: Hyper-V with dynamic memory
-- **Synced folders**:
-  - PSADT package → `C:\vagrant_package` (read-only)
-  - Results folder → `C:\vagrant_results`
-- **Provisioners**: Named PowerShell provisioners for install, validate, uninstall
+- **Copy-VMFile over SMB**: SMB synced folders require interactive credential prompts that break automation. Copy-VMFile transfers files directly through the Hyper-V bus with no network dependency.
+- **Guest Service Interface**: Must be enabled on the VM after boot for Copy-VMFile to work. The test runner handles this automatically.
+- **No `netcfg -d`**: Never use `netcfg -d` to troubleshoot networking. It resets all network drivers and can require a full Windows reinstall.
+- **`--no-provision` on boot**: Separates VM startup from provisioning so files can be copied in between.
+- **Self-elevating scripts**: Hyper-V operations require admin. Scripts detect and self-elevate via UAC prompt.
 
 ## Troubleshooting
 
-- **"Vagrant box not found"**: Run `vagrant box add gusztavvargadr/windows-11 --provider hyperv`
-- **SMB share prompt**: Vagrant synced folders on Hyper-V use SMB. Enter your Windows credentials when prompted, or use `type: "rsync"` in the Vagrantfile.
-- **VM won't start**: Ensure Hyper-V is enabled and no other hypervisor (VirtualBox) is conflicting.
+- **"Vagrant not found"**: Use full path `"C:\Program Files\Vagrant\bin\vagrant.exe"` or restart terminal after install.
+- **"No Hyper-V switches"**: Enable Hyper-V in Windows Features and reboot. The "Default Switch" is created automatically.
+- **"Guest Service Interface" errors**: The test runner enables this automatically. If it still fails, check that Hyper-V Integration Services are installed in the VM.
+- **VM boot timeout**: Increase `config.winrm.timeout` in Vagrantfile (default 600s).
 - **Slow first run**: The box download is ~6 GB. Subsequent runs reuse the cached box.
