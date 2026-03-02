@@ -97,3 +97,12 @@ Results are written to the `results/` directory:
 - **"Guest Service Interface" errors**: The test runner enables this automatically. If it still fails, check that Hyper-V Integration Services are installed in the VM.
 - **VM boot timeout**: Increase `config.winrm.timeout` in Vagrantfile (default 600s).
 - **Slow first run**: The box download is ~6 GB. Subsequent runs reuse the cached box.
+
+## Pipeline Context
+
+This skill is the second stage in the PSADT pipeline:
+1. **psadt** skill (`skills/psadt/`) — creates the PSADT deployment package
+2. **vagrant-test** skill (this) — tests install/uninstall in a disposable VM
+3. **intune-deploy** skill (`skills/intune-deploy/`) — wraps and uploads to Intune
+
+Use the **intune-packager** agent (`agents/intune-packager.md`) to orchestrate all three stages with user checkpoints.
